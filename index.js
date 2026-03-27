@@ -7,10 +7,18 @@ import GoogleStrategy from "passport-google-oauth2";
 import session from "express-session";
 import env from "dotenv";
 
+env.config();
+
 const app = express();
 const port = process.env.PORT || 3000;
 const saltRounds = 10;
-env.config();
+const isProduction = process.env.NODE_ENV === "production";
+
+app.set("trust proxy", 1);
+app.set("view engine", "ejs");
+
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static("public"));
 
 app.use(
   session({
@@ -19,15 +27,12 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: false, // true in production with HTTPS
+      secure: isProduction,
       sameSite: "lax",
-      maxAge: 1000 * 60 * 60 * 24, // 1 day
+      maxAge: 1000 * 60 * 60 * 24,
     },
   })
 );
-
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static("public"));
 
 app.use(passport.initialize());
 app.use(passport.session());
@@ -43,18 +48,18 @@ db.connect().catch((err) => {
   console.error("Database connection error:", err);
 });
 
-//GET ROUTES//
+// GET ROUTES
 
 app.get("/", (req, res) => {
-  res.render("home.ejs");
+  res.render("home");
 });
 
 app.get("/login", (req, res) => {
-  res.render("login.ejs");
+  res.render("login");
 });
 
 app.get("/register", (req, res) => {
-  res.render("register.ejs");
+  res.render("register");
 });
 
 app.get("/logout", (req, res, next) => {
@@ -76,16 +81,16 @@ app.get("/secrets", async (req, res) => {
 
     const userSecret = result.rows.length > 0 ? result.rows[0].secret : null;
 
-    res.render("secrets.ejs", { secret: userSecret });
+    res.render("secrets", { secret: userSecret });
   } catch (err) {
-    console.log(err);
-    res.render("secrets.ejs", { secret: null });
+    console.error(err);
+    res.render("secrets", { secret: null });
   }
 });
 
 app.get("/submit", (req, res) => {
   if (req.isAuthenticated()) {
-    res.render("submit.ejs");
+    res.render("submit");
   } else {
     res.redirect("/login");
   }
@@ -106,7 +111,7 @@ app.get(
   })
 );
 
-//POST ROUTES//
+// POST ROUTES
 
 app.post(
   "/login",
@@ -127,34 +132,39 @@ app.post("/register", async (req, res) => {
 
     if (checkResult.rows.length > 0) {
       return res.redirect("/login");
-    } else {
-      bcrypt.hash(password, saltRounds, async (err, hash) => {
-        if (err) {
-          console.error("Error hashing password:", err);
-          return res.status(500).send("Server error");
-        } else {
-          const result = await db.query(
-            "INSERT INTO users (email, password) VALUES ($1, $2) RETURNING *",
-            [email, hash]
-          );
-          const user = result.rows[0];
-          req.login(user, (err) => {
-            if (err) {
-              return res.status(500).send("Login failed");
-            }
-            res.redirect("/secrets");
-          });
-        }
-      });
     }
+
+    bcrypt.hash(password, saltRounds, async (err, hash) => {
+      if (err) {
+        console.error("Error hashing password:", err);
+        return res.status(500).send("Server error");
+      }
+
+      try {
+        const result = await db.query(
+          "INSERT INTO users (email, password) VALUES ($1, $2) RETURNING *",
+          [email, hash]
+        );
+
+        const user = result.rows[0];
+
+        req.login(user, (err) => {
+          if (err) {
+            console.error("Login after register failed:", err);
+            return res.status(500).send("Login failed");
+          }
+          res.redirect("/secrets");
+        });
+      } catch (dbErr) {
+        console.error("Insert user error:", dbErr);
+        res.status(500).send("Server error");
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).send("Server error");
   }
 });
-
-//TODO: Create the post route for submit.
-//Handle the submitted data and add it to the database
 
 app.post("/submit", async (req, res) => {
   try {
@@ -181,30 +191,35 @@ passport.use(
   "local",
   new Strategy(async function verify(username, password, cb) {
     try {
-      const result = await db.query("SELECT * FROM users WHERE email = $1 ", [
+      const result = await db.query("SELECT * FROM users WHERE email = $1", [
         username,
       ]);
-      if (result.rows.length > 0) {
-        const user = result.rows[0];
-        const storedHashedPassword = user.password;
-        bcrypt.compare(password, storedHashedPassword, (err, valid) => {
-          if (err) {
-            console.error("Error comparing passwords:", err);
-            return cb(err);
-          } else {
-            if (valid) {
-              return cb(null, user);
-            } else {
-              return cb(null, false);
-            }
-          }
-        });
-      } else {
+
+      if (result.rows.length === 0) {
         return cb(null, false);
       }
+
+      const user = result.rows[0];
+
+      if (!user.password) {
+        return cb(null, false);
+      }
+
+      bcrypt.compare(password, user.password, (err, valid) => {
+        if (err) {
+          console.error("Error comparing passwords:", err);
+          return cb(err);
+        }
+
+        if (valid) {
+          return cb(null, user);
+        } else {
+          return cb(null, false);
+        }
+      });
     } catch (err) {
-      cb(err);
-      console.log(err);
+      console.error(err);
+      return cb(err);
     }
   })
 );
@@ -223,22 +238,24 @@ passport.use(
         const result = await db.query("SELECT * FROM users WHERE email = $1", [
           profile.email,
         ]);
+
         if (result.rows.length === 0) {
           const newUser = await db.query(
             "INSERT INTO users (email, password) VALUES ($1, $2) RETURNING *",
-            [profile.email, "google"]
+            [profile.email, null]
           );
           return cb(null, newUser.rows[0]);
         } else {
           return cb(null, result.rows[0]);
         }
       } catch (err) {
+        console.error(err);
         return cb(err);
-        console.log(err);
       }
     }
   )
 );
+
 passport.serializeUser((user, cb) => {
   cb(null, user.id);
 });
@@ -248,6 +265,7 @@ passport.deserializeUser(async (id, cb) => {
     const result = await db.query("SELECT * FROM users WHERE id = $1", [id]);
     cb(null, result.rows[0]);
   } catch (err) {
+    console.error(err);
     cb(err);
   }
 });
